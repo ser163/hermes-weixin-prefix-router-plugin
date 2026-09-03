@@ -1,6 +1,6 @@
 name: weixin-prefix-router
-version: 1.0.0
-description: "Route WeChat (weixin) messages to different Hermes profiles by fixed prefix. Messages starting with a configured prefix (e.g. @coder) are routed to that profile's agent; all other messages go to the default Hermes agent."
+version: 0.2.0
+description: "Route WeChat (weixin) messages by fixed prefix to different Hermes profiles OR external AI agents (Maka, Pi, etc.) via pluggable adapters. Messages without a matching prefix go to the default Hermes agent."
 author: "Harry"
 hooks:
   - pre_gateway_dispatch

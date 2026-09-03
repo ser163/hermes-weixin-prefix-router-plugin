@@ -1,3 +1,5 @@
 {
-  "@coder": "coder"
+  "@coder": "coder",
+  "@maka": {"type": "adapter", "path": "maka"},
+  "@pi": {"type": "adapter", "path": "pi"}
 }

@@ -2,32 +2,43 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Hermes Agent](https://img.shields.io/badge/Hermes%20Agent-Plugin-blue)](https://hermes-agent.nousresearch.com)
+![Version](https://img.shields.io/badge/version-0.2.0-orange)
 
-Route WeChat (weixin) messages to different Hermes agent profiles by message prefix. Messages starting with a configured prefix (e.g., `@coder`) are forwarded to the corresponding profile's agent; all other messages go to the default Hermes agent.
+Route WeChat (weixin) messages by message prefix to **different Hermes profiles** or **external AI agents** (Maka, Pi, or any agent with a programmatic interface). Messages without a configured prefix go to the default Hermes agent.
 
 ## Architecture
 
 ```
-WeChat → Hermes Gateway → [weixin-prefix-router] ──┬─ "@coder message" → coder profile agent
-                                                      ├─ "/zcode message" → zcode profile agent
-                                                      └─ "normal message" → default Hermes agent
+WeChat → Hermes Gateway → [weixin-prefix-router] ──┬─ "@coder message"  → coder Hermes profile
+                                                     ├─ "@maka message"  → Maka adapter (external agent)
+                                                     ├─ "@pi message"    → Pi adapter (external agent)
+                                                     └─ "normal message" → default Hermes agent
 ```
 
-The plugin hooks into Hermes's `pre_gateway_dispatch` lifecycle event — fired before authorization and agent dispatch for every inbound message. It inspects the message text, rewrites it (stripping the prefix), and stamps `event.source.profile` to route the message to the target profile's session namespace and runtime.
+The plugin hooks into Hermes's `pre_gateway_dispatch` lifecycle event — fired before authorization and agent dispatch for every inbound message.
+
+Two routing modes:
+
+| Mode | Behavior |
+|------|----------|
+| **profile** | Sets `event.source.profile` and rewrites the text (strips prefix). The message flows into the target profile's session via Hermes's `multiplex_profiles` runtime. |
+| **adapter** | Calls an external agent adapter (`handle(text, chat_id, user_id) -> str`), sends the response back over WeChat, and skips Hermes dispatch entirely. |
 
 ## Features
 
-- **Prefix-based routing** — configure any prefix to map to any profile
-- **Multi-profile support** — works with Hermes's `gateway.multiplex_profiles` feature
+- **Prefix-based routing** — any prefix → any target
+- **Dual routing modes** — Hermes profile multiplexing *or* external agent adapters
+- **Plugin-driven adapters** — each external agent is a standalone directory with its own `__init__.py`; different agents can use completely different API/SDK/CLI conventions
 - **Zero core modification** — implemented as a standard Hermes plugin, survives upgrades
-- **Hot-reload routing table** — routes are read from `routes.json` on every message, no restart needed
-- **WeChat-only** — only affects weixin platform messages, other platforms pass through unchanged
+- **Hot-reload routing table** — `routes.json` is read on every message, no restart needed
+- **WeChat-only** — other platforms pass through untouched
 
 ## Requirements
 
 - Hermes Agent with WeChat gateway configured (iLink Bot API)
-- `gateway.multiplex_profiles: true` in `config.yaml`
-- Target profile(s) must exist and be configured
+- `gateway.multiplex_profiles: true` in `config.yaml` (for profile routes)
+- Target Hermes profile(s) must exist (for profile routes)
+- External agent API/SDK/CLI reachable (for adapter routes)
 
 ## Installation
 
@@ -38,14 +49,14 @@ git clone https://github.com/ser163/hermes-weixin-prefix-router-plugin.git \
   ~/AppData/Local/hermes/plugins/weixin-prefix-router
 ```
 
-Alternatively, copy the files manually:
+Or copy the files manually:
 
 ```bash
 mkdir -p ~/AppData/Local/hermes/plugins/weixin-prefix-router
 cp plugin.yaml __init__.py routes.json ~/AppData/Local/hermes/plugins/weixin-prefix-router/
 ```
 
-### 2. Enable multiplex profiles
+### 2. Enable multiplex profiles (for profile routes)
 
 ```bash
 hermes config set gateway.multiplex_profiles true
@@ -67,8 +78,8 @@ hermes gateway restart
 
 ```bash
 tail -f ~/AppData/Local/hermes/logs/gateway.log
-# Look for: "weixin: restored 1 context token(s)" → gateway connected
-# Check plugin loaded: hermes plugins list | grep weixin-prefix
+# Expect: "weixin: restored 1 context token(s)" → gateway connected
+# And in plugin load output: "loaded N route(s)"
 ```
 
 ## Configuration
@@ -78,39 +89,86 @@ Edit `routes.json` in the plugin directory:
 ```json
 {
   "@coder": "coder",
-  "/zcode": "zcode"
+  "@maka": {"type": "adapter", "path": "maka"},
+  "@pi": {"type": "adapter", "path": "pi"}
 }
 ```
 
-Each key is a **message prefix** and each value is the **target Hermes profile name**:
+### Route types
 
-| Key       | Value  | Effect                             |
-|-----------|--------|------------------------------------|
-| `@coder`  | coder  | `@coder <message>` → coder profile |
-| `/zcode`  | zcode  | `/zcode <message>` → zcode profile |
+#### Profile route (string shorthand)
 
-The prefix is **stripped** from the message before it reaches the target profile's agent. The profile name must match a valid Hermes profile directory name.
+```json
+"@coder": "coder"
+```
+
+Full form: `{"type": "profile", "profile": "coder"}`. The prefix is stripped and the message is routed to the named Hermes profile.
+
+#### Adapter route (external agent)
+
+```json
+"@maka": {"type": "adapter", "path": "maka"}
+```
+
+`path` resolves relative to the adapter base directory `E:/test/ai/` — so `"maka"` loads `E:/test/ai/maka/__init__.py`. Absolute paths also work.
+
+## Writing an Adapter
+
+Each external agent lives in its own directory under `E:/test/ai/`:
+
+```
+E:/test/ai/
+├── maka/__init__.py   # Maka agent adapter
+└── pi/__init__.py     # Pi agent adapter
+```
+
+Every adapter must export a `handle` function:
+
+```python
+async def handle(text: str, chat_id: str = "", user_id: str = "") -> str:
+    """Process the message and return the response text."""
+    return "response text"
+```
+
+- `text` — the message with the prefix already stripped
+- `chat_id` / `user_id` — WeChat source identifiers (useful for per-user session state)
+- Return value — the response sent back over WeChat
+- Both sync and async handlers are supported
+- Errors are caught by the plugin; an error notice is sent back over WeChat
+
+Adapters are free to use any transport: HTTP API (aiohttp/httpx/requests), subprocess CLI, SDK, etc. The canonical adapter template:
+
+```python
+from __future__ import annotations
+import aiohttp
+
+async def handle(text: str, chat_id: str = "", user_id: str = "") -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://agent.example.com/api/chat",
+            json={"message": text, "session_id": f"weixin-{chat_id or user_id}"},
+        ) as resp:
+            data = await resp.json()
+            return data.get("response") or str(data)
+```
 
 ## Usage
 
 In WeChat, send a message to your bot:
 
-- `@coder 帮我写一个 Python 排序函数` → routed to **coder profile** agent, receives `帮我写一个 Python 排序函数`
-- `你好，今天天气怎么样？` → routed to **default Hermes agent** (no prefix match)
+- `@coder 帮我写一个 Python 排序函数` → **coder profile agent**
+- `@maka 分析这个项目结构` → **Maka external agent**
+- `@pi 帮我重构这段代码` → **Pi external agent**
+- `你好，今天天气怎么样？` → **default Hermes agent** (no prefix)
 
 ## How It Works
 
 1. **Plugin hook**: `pre_gateway_dispatch` fires for every inbound message
 2. **Platform check**: only `weixin` platform messages are processed
-3. **Prefix match**: iterates `routes.json` entries, checks if `text.startswith(prefix)`
-4. **Route**: if match, sets `event.source.profile = target_profile` and returns `{"action": "rewrite", "text": stripped_text}`
-5. **Fallback**: no match → returns `None`, normal Hermes dispatch
-
-The gateway's `_resolve_profile_home_for_source` method picks up the `source.profile` field and routes the session to the target profile's home directory, loading its model, tools, skills, and memory configuration.
-
-## Dependencies
-
-None. The plugin uses only Python standard library and Hermes's built-in plugin API (`hermes_cli.plugins.PluginContext`).
+3. **Prefix match**: iterates `routes.json`, checks `text.startswith(prefix)`
+4. **Profile route**: sets `event.source.profile`, returns `{"action": "rewrite", "text": stripped}` → Hermes multiplex routes the session to the target profile home
+5. **Adapter route**: schedules `_forward_to_adapter()` (async → external agent → response → WeChat reply), returns `{"action": "skip"}` to bypass Hermes dispatch
+6. **No match**: returns `None` → normal Hermes dispatch
 
 ## Development
 
@@ -119,7 +177,7 @@ None. The plugin uses only Python standard library and Hermes's built-in plugin 
 ```
 hermes-weixin-prefix-router-plugin/
 ├── plugin.yaml          # Hermes plugin manifest
-├── __init__.py          # Plugin implementation
+├── __init__.py          # Plugin implementation (v0.2.0 dual routing)
 ├── routes.json          # Default routing configuration
 ├── README.md            # This file
 ├── LICENSE              # MIT License
@@ -140,12 +198,17 @@ from gateway.session import SessionSource
 pm = PluginManager()
 pm.discover_and_load(force=True)
 
-source = SessionSource(platform=Platform.WEIXIN, chat_id='test', user_id='user1')
+# Profile route
+source = SessionSource(platform=Platform.WEIXIN, chat_id='t', user_id='u')
 event = MessageEvent(text='@coder hello', source=source)
-results = pm.invoke_hook('pre_gateway_dispatch', event=event, gateway=None, session_store=None)
+pm.invoke_hook('pre_gateway_dispatch', event=event, gateway=None, session_store=None)
+print(f'Profile: {event.source.profile}')  # 'coder'
 
-print(f'Profile: {event.source.profile}')  # Should be 'coder'
-print(f'Text: {event.text}')               # Should be rewritten to 'hello'
+# Adapter route (skips dispatch)
+source2 = SessionSource(platform=Platform.WEIXIN, chat_id='t', user_id='u')
+event2 = MessageEvent(text='@maka hello', source=source2)
+results = pm.invoke_hook('pre_gateway_dispatch', event=event2, gateway=None, session_store=None)
+print(f'Action: {results[0][\"action\"]}')  # 'skip'
 "
 ```
 
