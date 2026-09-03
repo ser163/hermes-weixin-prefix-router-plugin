@@ -4,7 +4,7 @@ import json
 
 import aiohttp
 
-BASE = "http://127.0.0.1:19890"
+BASE = "http://127.0.0.1:19860"
 
 
 async def hermes_plugin_submit(session, text: str) -> dict:

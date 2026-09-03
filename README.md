@@ -188,7 +188,7 @@ WeChat user
 Hermes WeChat gateway ── @maka message ──► weixin-prefix-router plugin
    │                                              │ POST /bridge/inbound
    │                                              ▼
-   │                                    wechat-bridge (127.0.0.1:19890)
+   │                                    wechat-bridge (127.0.0.1:19860)
    │                                              │ getupdates (long-poll)
    │                                              ▼
    │                                    Maka WeChat bot channel ──► Maka agent
@@ -201,13 +201,13 @@ Hermes WeChat gateway ── @maka message ──► weixin-prefix-router plugin
 
 ```bash
 cd adapters/maka
-python bridge.py                # listens on 127.0.0.1:19890
+python bridge.py                # listens on 127.0.0.1:19860
 ```
 
 ### 2. Get a verification code
 
 ```bash
-curl -X POST http://127.0.0.1:19890/bridge/onboard
+curl -X POST http://127.0.0.1:19860/bridge/onboard
 # → {"ret":0, "verification_code":"482913", "expires_in":300, ...}
 ```
 

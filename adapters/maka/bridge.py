@@ -6,7 +6,7 @@ connects to instead of ``ilinkai.weixin.qq.com``. Bridges messages between
 Maka's agent and Hermes's WeChat gateway.
 
 Usage:
-    python bridge.py              # start on default port 19890
+    python bridge.py              # start on default port 19860
     python bridge.py --port 9090
     python bridge.py --port 9090 --onboard  # generate onboarding verification code
 
@@ -14,7 +14,7 @@ Architecture::
 
     Hermes WeChat → plugin → adapter → POST /bridge/inbound ─┐
                                                                  v
-    ┌──────────────── wechat-bridge (port 19890) ─────────────────┐
+    ┌──────────────── wechat-bridge (port 19860) ─────────────────┐
     │  inbound_queue: [msg1, msg2, ...]           outbound_store │
     │  ┌─ iLink endpoints (for Maka) ───┐  ┌─ internal endpoints ┐│
     │  │ POST /ilink/bot/getconfig      │  │ POST /bridge/inbound  ││
@@ -51,7 +51,7 @@ except ImportError:
 logger = logging.getLogger("wechat-bridge")
 
 # ── defaults ──────────────────────────────────────────────────────────────
-DEFAULT_PORT = 19890
+DEFAULT_PORT = 19860
 ONBOARD_TIMEOUT = 300          # 5 minutes for verification code
 POLL_TIMEOUT = 30              # getupdates long-poll wait
 ACCOUNT_ID = "wechat-bridge"   # Maka's bot identity (like b5b33621)

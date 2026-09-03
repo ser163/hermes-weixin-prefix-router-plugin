@@ -20,7 +20,7 @@ import os
 import aiohttp
 
 # ── bridge endpoint config ────────────────────────────────────────────────
-BRIDGE_URL = os.getenv("MAKA_BRIDGE_URL", "http://127.0.0.1:19890")
+BRIDGE_URL = os.getenv("MAKA_BRIDGE_URL", "http://127.0.0.1:19860")
 REQUEST_TIMEOUT = 150          # must be longer than the bridge's 120s wait
 
 
