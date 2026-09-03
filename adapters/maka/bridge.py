@@ -366,7 +366,7 @@ async def handle_inbound(request: web.Request) -> web.Response:
 
     # Wait for Maka's reply (with timeout)
     try:
-        response = await asyncio.wait_for(future, timeout=120)
+        response = await asyncio.wait_for(future, timeout=600)
         logger.info("inbound reply ready: request=%s text=%r", request_id, response.text[:80])
         return web.json_response({
             "ret": 0,
@@ -375,6 +375,7 @@ async def handle_inbound(request: web.Request) -> web.Response:
         })
     except asyncio.TimeoutError:
         state.outbound.pop(request_id, None)
+        state._pending_by_chat.pop(chat_id, None)
         logger.warning("inbound timeout: request=%s", request_id)
         return web.json_response({"ret": -1, "errmsg": "timeout"})
 

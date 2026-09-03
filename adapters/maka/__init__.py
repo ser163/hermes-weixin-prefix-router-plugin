@@ -21,7 +21,7 @@ import aiohttp
 
 # ── bridge endpoint config ────────────────────────────────────────────────
 BRIDGE_URL = os.getenv("MAKA_BRIDGE_URL", "http://127.0.0.1:19860")
-REQUEST_TIMEOUT = 150          # must be longer than the bridge's 120s wait
+REQUEST_TIMEOUT = 620          # must be longer than the bridge's 600s wait
 
 
 async def _bridge_alive() -> bool:
@@ -56,7 +56,7 @@ async def handle(text: str, chat_id: str = "", user_id: str = "") -> str:
     if data.get("ret") == 0:
         return data.get("text", "")
     if data.get("errmsg") == "timeout":
-        return "⚠️ Maka 处理超时（120秒无响应）"
+        return "⚠️ Maka 处理超时（10分钟无响应）"
     return f"⚠️ Maka 桥接错误: {data.get('errmsg', 'unknown')}"
 
 
