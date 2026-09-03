@@ -1,91 +1,102 @@
-"""Concurrent end-to-end test for wechat-bridge (simulates both sides)."""
+"""E2E test for wechat-bridge v3 (persistent token).
+
+Simulates the full flow with the persistent token model:
+  Hermes: onboard (get token) → submit inbound → wait for reply
+  Maka:   GET /health → GET /messages/stream (SSE) → POST /send
+"""
 import asyncio
 import json
+import sys
 
 import aiohttp
 
 BASE = "http://127.0.0.1:19860"
+PASS = 0
+FAIL = 0
 
-
-async def hermes_plugin_submit(session, text: str) -> dict:
-    """Simulate Hermes plugin: submit message, wait for reply (blocks)."""
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{BASE}/bridge/inbound",
-            json={"text": text, "chat_id": "wx_user1", "user_id": "wx_user1"},
-            timeout=60,
-        ) as resp:
-            return await resp.json()
-
-
-async def maka_poll_and_reply(session, auth_header: str) -> None:
-    """Simulate Maka: poll getupdates, then send reply via sendmessage."""
-    async with aiohttp.ClientSession() as s:
-        headers = {"Authorization": auth_header}
-        # Poll getupdates until a message arrives
-        for attempt in range(30):
-            async with s.post(f"{BASE}/ilink/bot/getupdates", json={}, headers=headers) as resp:
-                data = await resp.json()
-                messages = data.get("messages", [])
-                if messages:
-                    ctx = messages[0].get("context_token", "")
-                    for item in messages[0].get("item_list", []):
-                        if item.get("type") == 1:
-                            received = item["text_item"]["text"]
-                    reply = {
-                        "msg": {
-                            "from_user_id": "maka-test",
-                            "to_user_id": "wx_user1",
-                            "client_id": "maka-test",
-                            "message_type": 2,
-                            "message_state": 2,
-                            "item_list": [{
-                                "type": 1,
-                                "text_item": {"text": f"Maka收到: {received}"},
-                            }],
-                            "context_token": ctx,
-                        }
-                    }
-                    async with s.post(f"{BASE}/ilink/bot/sendmessage", json=reply, headers=headers) as r2:
-                        await r2.json()
-                    print(f"[maka] polled msg: {received!r}, replied OK")
-                    return
-            await asyncio.sleep(0.5)
-        print("[maka] poll timed out - no messages in 15s")
-
+async def check(name, ok, detail=""):
+    global PASS, FAIL
+    if ok: PASS += 1
+    else: FAIL += 1
+    print(f"  {'PASS' if ok else 'FAIL'}  {name} {detail}")
 
 async def main():
-    async with aiohttp.ClientSession() as session:
-        # 1. Onboard → get code → authorize
-        async with session.post(f"{BASE}/bridge/onboard") as resp:
-            code = (await resp.json())["verification_code"]
-            print(f"[setup] onboard code: {code}")
+    # 1. Onboard → get persistent token
+    async with aiohttp.ClientSession() as s:
+        r = await s.post(f"{BASE}/bridge/onboard", timeout=5)
+        d = await r.json()
+        token = d.get("token", "")
+        await check("onboard: token returned", d.get("ret") == 0 and len(token) >= 16,
+                    f"len={len(token)}")
 
-        async with session.post(
-            f"{BASE}/ilink/bot/getconfig",
-            json={"ilink_user_id": "maka-test"},
-            headers={"Authorization": f"Bearer {code}"},
-        ) as resp:
-            auth = await resp.json()
-            print(f"[setup] authorize: {auth}")
-            assert auth["ret"] == 0
+    # 2. /health without auth → 401
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(f"{BASE}/health", timeout=5)
+        await check("health: no auth → 401", r.status == 401)
 
-        # 2. Concurrent: Hermes submits (waits for reply) + Maka polls/replies
-        submit_task = asyncio.create_task(
-            hermes_plugin_submit(session, "请分析一下今天的任务")
-        )
-        await asyncio.sleep(0.5)  # let inbound land
-        poll_task = asyncio.create_task(
-            maka_poll_and_reply(session, f"Bearer {code}")
-        )
+    # 3. /health with Bearer token → 200 (Maka's real behavior)
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(f"{BASE}/health",
+            headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        body = await r.json()
+        await check("health: with token → 200", r.status == 200,
+                    f"send_status={body.get('send_status')}")
+        await check("health: send_status available", body.get("send_status") == "available")
 
-        # Wait for both
-        results = await asyncio.gather(submit_task, poll_task)
-        print(f"\n[hermes] reply received: {results[0]}")
-        assert results[0]["ret"] == 0
-        assert "Maka收到" in results[0]["text"]
-        print("\n=== E2E TEST PASSED ===")
+    # 4. Wrong token rejected
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(f"{BASE}/health",
+            headers={"Authorization": "Bearer bad-token"}, timeout=5)
+        await check("health: bad token → 401", r.status == 401)
 
+    # 5. Hermes submits inbound; Maka SSE-receives and replies via /send
+    async def submit():
+        async with aiohttp.ClientSession() as s:
+            r = await s.post(f"{BASE}/bridge/inbound",
+                json={"text": "测试消息", "chat_id": "wx_user", "user_id": "wx_user"},
+                timeout=30)
+            return await r.json()
+
+    async def maka_sse_and_reply():
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{BASE}/messages/stream?since=0",
+                headers={"Authorization": f"Bearer {token}"}, timeout=30) as resp:
+                buffer = ""
+                async for chunk in resp.content.iter_any():
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    for line in buffer.split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                data = json.loads(line[6:])
+                                if data.get("body"):
+                                    reply = await s.post(f"{BASE}/send",
+                                        json={"wxid": "wx_user", "text": "MakaOK"},
+                                        headers={"Authorization": f"Bearer {token}"}, timeout=5)
+                                    rdata = await reply.json()
+                                    print(f"  [maka] replied: {rdata.get('status')}")
+                                    return
+                            except json.JSONDecodeError:
+                                pass
+                    buffer = buffer[-5000:]
+
+    submit_task = asyncio.create_task(submit())
+    await asyncio.sleep(0.5)
+    sse_task = asyncio.create_task(maka_sse_and_reply())
+    results = await asyncio.gather(submit_task, sse_task)
+
+    await check("inbound got reply", results[0].get("ret") == 0,
+                f"text={results[0].get('text','')!r}")
+    await check("reply text matches", results[0].get("text") == "MakaOK")
+
+    # 6. Bad token rejected on /send
+    async with aiohttp.ClientSession() as s:
+        r = await s.post(f"{BASE}/send",
+            json={"wxid": "x", "text": "test"},
+            headers={"Authorization": "Bearer bad-token"}, timeout=5)
+        await check("send rejects bad token", r.status == 401)
+
+    print(f"\nRESULT: {PASS} passed, {FAIL} failed")
+    sys.exit(1 if FAIL else 0)
 
 if __name__ == "__main__":
     asyncio.run(main())

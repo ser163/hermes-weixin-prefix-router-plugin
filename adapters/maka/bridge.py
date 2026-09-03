@@ -1,33 +1,23 @@
 """
-wechat-bridge — fake iLink server for Maka bot channel integration.
+wechat-bridge — Maka 本地桥接服务器（v2: 本地 bridge 协议 version）
 
-Acts as a local iLink-compatible endpoint that Maka's wechat bot channel
-connects to instead of ``ilinkai.weixin.qq.com``. Bridges messages between
-Maka's agent and Hermes's WeChat gateway.
+Maka 桌面版的 WeChat 通道支持两种模式：
+  1. iLink 模式：webhookUrl 为 https://ilinkai.weixin.qq.com（真实腾讯）
+  2. **本地 bridge 模式**（默认）：webhookUrl 为 http://127.0.0.1:PORT
 
-Usage:
-    python bridge.py              # start on default port 19860
-    python bridge.py --port 9090
-    python bridge.py --port 9090 --onboard  # generate onboarding verification code
+本服务实现模式 2 —— Maka 期望的本地 bridge 协议端点：
 
-Architecture::
+  GET  /health                    → 健康检查 + 身份信息
+  POST /send                      → 发送消息 ({wxid, text})
+  GET  /messages/stream?since=X   → SSE 消息流（接收消息）
+  GET  /api/weixin/qrcode         → 二维码信息（mock/可选）
+  GET  /qrcode                    → 同上（备选路径）
 
-    Hermes WeChat → plugin → adapter → POST /bridge/inbound ─┐
-                                                                 v
-    ┌──────────────── wechat-bridge (port 19860) ─────────────────┐
-    │  inbound_queue: [msg1, msg2, ...]           outbound_store │
-    │  ┌─ iLink endpoints (for Maka) ───┐  ┌─ internal endpoints ┐│
-    │  │ POST /ilink/bot/getconfig      │  │ POST /bridge/inbound  ││
-    │  │ POST /ilink/bot/getupdates     │  │ GET  /bridge/outbound ││
-    │  │ POST /ilink/bot/sendmessage    │  │ POST /bridge/onboard  ││
-    │  └────────────────────────────────┘  └──────────────────────┘│
-    └──────────────────────────────────────────────────────────────┘
-              │
-              v (Maka polls getupdates → gets message)
-    Maka agent processes → sends reply via sendmessage
-              │
-              v (bridge captures reply → Hermes polls outbound)
-    Hermes plugin → WeChat gateway → user
+  POST /bridge/inbound            → Hermes 插件投递消息（内部）
+  GET  /bridge/status             → 桥接状态（内部）
+  POST /bridge/onboard            → 生成验证码（内部）
+
+认证：X-API-Key: <token> 头（token 即验证码）
 """
 from __future__ import annotations
 
@@ -39,45 +29,45 @@ import random
 import string
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional, Set
 
 try:
-    import aiohttp
     from aiohttp import web
 except ImportError:
-    aiohttp = None
     web = None
 
 logger = logging.getLogger("wechat-bridge")
 
 # ── defaults ──────────────────────────────────────────────────────────────
 DEFAULT_PORT = 19860
-ONBOARD_TIMEOUT = 300          # 5 minutes for verification code
-POLL_TIMEOUT = 30              # getupdates long-poll wait
-ACCOUNT_ID = "wechat-bridge"   # Maka's bot identity (like b5b33621)
+ONBOARD_TIMEOUT = 300
+SSE_PING_INTERVAL = 25  # Maka 的 GET /messages/stream 长连接保活间隔
 
 
 # ── data types ────────────────────────────────────────────────────────────
 
 @dataclass
 class InboundMessage:
-    """Message from Hermes WeChat gateway, waiting for Maka to process."""
+    """Message from Hermes WeChat gateway, waiting for Maka to consume."""
     text: str
     chat_id: str
     user_id: str
     request_id: str = ""
     queued_at: float = 0.0
 
-    def to_ilink(self) -> Dict[str, Any]:
-        """Convert to iLink getupdates message format."""
+    def to_bridge_message(self) -> Dict[str, Any]:
+        """Convert to Maka's bridge message format (SSE stream)."""
         return {
-            "from_user_id": self.user_id or self.chat_id,
-            "to_user_id": self.chat_id,
-            "client_id": self.request_id or "hermes",
-            "message_type": 2,
-            "message_state": 2,
-            "item_list": [{"type": 1, "text_item": {"text": self.text}}],
-            "context_token": f"bridge-ctx-{self.request_id}",
+            "chatId": self.chat_id,
+            "senderId": self.user_id or self.chat_id,
+            "senderName": self.user_id or self.chat_id,
+            "messageId": self.request_id,
+            "body": self.text,
+            "text": self.text,
+            "timestamp": int(self.queued_at * 1000),
+            "isGroup": False,
+            "isMentioned": True,
+            "fromSelf": False,
         }
 
 
@@ -89,205 +79,259 @@ class OutboundResponse:
     replied_at: float = 0.0
 
 
+# ── token persistence ─────────────────────────────────────────────────────
+
+def _get_token_file() -> str:
+    """Path to the persistent token file, next to bridge.py."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat-bridge.token")
+
+
+def _load_or_create_token() -> str:
+    """Load persistent token from disk, or create a new one."""
+    token_file = _get_token_file()
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+        if token:
+            logger.info("loaded persistent token from %s", token_file)
+            return token
+    # Generate a new 32-char random hex token
+    token = "".join(random.choices(string.hexdigits, k=32))
+    with open(token_file, "w") as f:
+        f.write(token + "\n")
+    logger.info("created new persistent token: %s", token)
+    return token
+
+
 # ── bridge state ──────────────────────────────────────────────────────────
 
 class BridgeState:
     """Shared state for the bridge server."""
 
-    def __init__(self):
+    def __init__(self, token: str):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: Dict[str, asyncio.Future] = {}
-        self._onboard_code: Optional[str] = None
-        self._onboard_created: float = 0
-        self._bot_token: Optional[str] = None
-        self._context_tokens: Dict[str, str] = {}
-
-    # ── onboarding ────────────────────────────────────────────────────────
-
-    def generate_onboard_code(self) -> str:
-        """Generate a 6-digit verification code for Maka onboarding."""
-        code = "".join(random.choices(string.digits, k=6))
-        self._onboard_code = code
-        self._onboard_created = time.time()
-        logger.info("onboarding code generated: %s", code)
-        return code
-
-    def verify_onboard_code(self, code: str) -> bool:
-        """Verify the onboarding code and promote it to the bot token.
-
-        Maka's WeChat channel is configured with the verification code as
-        its bot token. When Maka calls getconfig with
-        ``Authorization: Bearer <code>``, we validate the code and then
-        accept it as the long-lived bot token for all subsequent calls.
-        """
-        if not self._onboard_code:
-            return False
-        if time.time() - self._onboard_created > ONBOARD_TIMEOUT:
-            logger.warning("onboarding code expired")
-            return False
-        if self._onboard_code != code.strip():
-            return False
-        # Code verified — it becomes the bot token itself
-        self._bot_token = code.strip()
-        self._onboard_code = None  # one-time use
-        logger.info("onboarding verified — verification code promoted to bot token")
-        return True
+        # Map chat_id → latest pending request_id (Maka's /send echoes wxid)
+        self._pending_by_chat: Dict[str, str] = {}
+        # Persistent token (loaded from disk or newly created)
+        self._bot_token: str = token
+        # SSE subscribers: set of asyncio.Queue used to push messages to
+        # Maka's /messages/stream long-poll connections
+        self._sse_queues: Set[asyncio.Queue] = set()
 
     @property
     def is_authorized(self) -> bool:
-        return self._bot_token is not None
+        return True  # Always authorized — token is set at startup
 
-    def check_auth(self, auth_header: str = "") -> bool:
-        """Check if the request is authorized (Bearer token match)."""
-        if not self._bot_token:
-            return False
-        expected = f"Bearer {self._bot_token}"
-        return auth_header.strip() == expected
+    def check_auth(self, api_key: str = "") -> bool:
+        """Check if the token matches the persistent bot token."""
+        return api_key.strip() == self._bot_token
+
+    async def broadcast_to_sse(self, message: InboundMessage) -> None:
+        """Push a message to all active SSE subscribers."""
+        if not self._sse_queues:
+            return
+        data = json.dumps(message.to_bridge_message(), ensure_ascii=False)
+        dead_queues = set()
+        for q in self._sse_queues:
+            try:
+                await q.put(data)
+            except Exception:
+                dead_queues.add(q)
+        self._sse_queues -= dead_queues
 
 
-# ── iLink endpoints (for Maka) ────────────────────────────────────────────
+# ── auth middleware ───────────────────────────────────────────────────────
 
-async def _require_auth(request: web.Request, state: BridgeState) -> bool:
-    """Check that the request carries a valid bot token.
+def _extract_token(request: web.Request) -> str:
+    """Extract token from Authorization header (Maka sends Bearer token)."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):].strip()
+    # Fallback: X-API-Key (for test compatibility)
+    return request.headers.get("X-API-Key", "").strip()
 
-    Returns True if authorized. If not, the response has already been sent.
-    """
+
+def _require_auth(state: BridgeState, request: web.Request) -> bool:
+    """Check if request carries a valid bot token."""
     if not state.is_authorized:
-        # Already handled by the calling handler — just return False
         return False
-    auth = request.headers.get("Authorization", "")
-    expected = f"Bearer {state._bot_token}"
-    if auth.strip() == expected:
-        return True
-    return False
+    token = _extract_token(request)
+    return state.check_auth(token)
 
 
-async def handle_getconfig(request: web.Request) -> web.Response:
-    """GETCONFIG: validate token and return config."""
+# ── Maka bridge endpoints (Maka calls these) ──────────────────────────────
+
+async def handle_health(request: web.Request) -> web.Response:
+    """GET /health — Maka 连接测试 + 健康检查。
+
+    Maka 的 testWechatBridge() 调用此端点，携带 Authorization: Bearer <token>。
+    token 是持久化到磁盘的 32 位随机字符串，bridge 启动时自动生成。
+    """
     state: BridgeState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    token = _extract_token(request)
 
-    ilink_user_id = body.get("ilink_user_id", "")
+    if not state.check_auth(token):
+        return web.json_response({"error": "invalid_token", "message": "Token mismatch"}, status=401)
 
-    # If not yet authorized, try to onboard using the verification code
-    # as the bearer token (Maka sets the code as the bot token)
-    auth = request.headers.get("Authorization", "")
-    if not state.is_authorized:
-        if auth.startswith("Bearer "):
-            code = auth[len("Bearer "):]
-            if state.verify_onboard_code(code):
-                return web.json_response({
-                    "ret": 0,
-                    "typing_ticket": f"bridge-onboard-ok-{ACCOUNT_ID}",
-                })
-        # Check if we're still in onboarding — return "need code" info
-        return web.json_response({
-            "ret": -2,
-            "errmsg": "onboarding_required",
-            "bridge_info": {
-                "onboarding_url": f"http://127.0.0.1:{request.app['port']}/bridge/onboard",
-                "method": "POST",
-                "description": "Send POST to /bridge/onboard to get a verification code, "
-                               "then enter it as the bot token in Maka's WeChat channel settings.",
-            },
-        })
-
-    # Authorized — validate token
-    if not await _require_auth(request, state):
-        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
-
-    # Normal getconfig
     return web.json_response({
-        "ret": 0,
-        "typing_ticket": f"bridge-tt-{ACCOUNT_ID}-{int(time.time())}",
-        "account_id": ACCOUNT_ID,
+        "wxid": "wechat-bridge",
+        "nickname": "WeChat Bridge",
+        "alias": "Hermes-Maka Bridge",
+        "self": {"wxid": "wechat-bridge"},
+        "send_status": "available",
+        "status": "running",
     })
 
 
-async def handle_getupdates(request: web.Request) -> web.Response:
-    """GETUPDATES: long-poll, wait for inbound messages from Hermes."""
+async def handle_send(request: web.Request) -> web.Response:
+    """POST /send — Maka 发送消息。
+
+    Maka 的 sendMessage() 调用此端点，payload:
+      { "wxid": "目标 chatId", "text": "消息内容" }
+    返回:
+      { "status": "ok", "messageId": "<id>", "svrId": "<id>" }
+    """
     state: BridgeState = request.app["state"]
     if not state.is_authorized:
-        return web.json_response({"ret": -2, "errmsg": "not_authorized"})
-    if not await _require_auth(request, state):
-        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
-
-    try:
-        # Wait for a message from the inbound queue (with timeout)
-        message = await asyncio.wait_for(
-            state.inbound.get(), timeout=POLL_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        # No messages — return empty (Maka will re-poll)
-        return web.json_response({"ret": 0, "messages": []})
-
-    # Return the message in iLink format
-    msg_data = message.to_ilink()
-    # Store context_token for later use
-    state._context_tokens[message.request_id] = msg_data["context_token"]
-
-    return web.json_response({
-        "ret": 0,
-        "messages": [msg_data],
-    })
-
-
-async def handle_sendmessage(request: web.Request) -> web.Response:
-    """SENDMESSAGE: capture Maka's reply for the Hermes plugin."""
-    state: BridgeState = request.app["state"]
-    if not state.is_authorized:
-        return web.json_response({"ret": -2, "errmsg": "not_authorized"})
-    if not await _require_auth(request, state):
-        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
+        return web.json_response({"error": "not_authorized"}, status=401)
+    if not _require_auth(state, request):
+        return web.json_response({"error": "invalid_token"}, status=401)
 
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"ret": -2, "errmsg": "invalid_json"})
+        return web.json_response({"error": "invalid_json"}, status=400)
 
-    msg = body.get("msg", {})
-    item_list = msg.get("item_list", [])
-    reply_text = ""
-    for item in item_list:
-        if item.get("type") == 1:  # text
-            text_item = item.get("text_item", {})
-            reply_text = text_item.get("text", "")
+    target_wxid = body.get("wxid", "")
+    text = body.get("text", "")
 
-    # Extract the context_token to match request_id
-    context_token = msg.get("context_token", "")
+    if not text:
+        return web.json_response({"error": "text_required"}, status=400)
+
+    # Find the pending request for this chat_id (Maka echoes the same
+    # wxid/chatId it received the message on)
     request_id = ""
-    for rid, ctx in state._context_tokens.items():
-        if ctx == context_token:
-            request_id = rid
-            break
+    pending_by_chat = getattr(state, "_pending_by_chat", {})
+    if target_wxid in pending_by_chat:
+        request_id = pending_by_chat[target_wxid]
 
     if not request_id:
-        # Try to find from message content
-        request_id = msg.get("client_id", f"reply-{int(time.time())}")
+        request_id = f"reply-{int(time.time() * 1000)}"
 
-    # Store the response
+    # Resolve the outbound future
     if request_id in state.outbound:
         future = state.outbound.pop(request_id)
         if not future.done():
             future.set_result(OutboundResponse(
-                text=reply_text,
+                text=text,
                 request_id=request_id,
                 replied_at=time.time(),
             ))
-        logger.info("reply captured for request=%s: %d chars", request_id, len(reply_text))
+        logger.info("reply captured for request=%s: %d chars", request_id, len(text))
+    else:
+        # Unmatched reply — store under a generated key
+        logger.info("unmatched reply (no pending request): %s chars", len(text))
 
+    message_id = int(time.time() * 1000)
     return web.json_response({
-        "message_id": int(time.time() * 1000),
+        "status": "ok",
+        "messageId": str(message_id),
+        "svrId": str(message_id),
+    })
+
+
+async def handle_messages_stream(request: web.Request) -> web.Response:
+    """GET /messages/stream?since=X — SSE 消息流连接。
+
+    Maka 会持续连接此端点，通过 SSE 接收消息。Hermes 插件投递的
+    消息会被推送到此流中。
+    """
+    state: BridgeState = request.app["state"]
+    if not state.is_authorized:
+        return web.Response(status=401, text="not_authorized")
+    if not _require_auth(state, request):
+        return web.Response(status=401, text="invalid_token")
+
+    since = request.query.get("since", "0")
+
+    # Create a queue for this SSE subscriber
+    queue: asyncio.Queue = asyncio.Queue()
+    state._sse_queues.add(queue)
+
+    async def sse_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            # Send initial connected event
+            yield b"event: connected\ndata: {}\n\n"
+
+            # Also deliver any queued messages
+            while not state.inbound.empty():
+                try:
+                    msg = state.inbound.get_nowait()
+                    data = json.dumps(msg.to_bridge_message(), ensure_ascii=False)
+                    yield f"data: {data}\n\n".encode("utf-8")
+                except asyncio.QueueEmpty:
+                    break
+
+            # Main loop: wait for new messages or ping
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
+                    yield f"data: {data}\n\n".encode("utf-8")
+                except asyncio.TimeoutError:
+                    # SSE keepalive ping
+                    yield b": ping\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            state._sse_queues.discard(queue)
+
+    resp = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await resp.prepare(request)
+    async for chunk in sse_stream():
+        try:
+            await resp.write(chunk)
+        except (ConnectionResetError, ConnectionAbortedError):
+            break
+    return resp
+
+
+async def handle_qrcode(request: web.Request) -> web.Response:
+    """GET /api/weixin/qrcode 或 GET /qrcode — 二维码信息。
+
+    Maka 在 onboarding 时调用，期望返回 QR 码数据。我们的 bridge
+    使用验证码替代扫码，所以返回一个 mock 成功的响应。
+    """
+    state: BridgeState = request.app["state"]
+    if not state.is_authorized:
+        return web.json_response(
+            {"ok": False, "error": "not_authorized",
+             "hint": "请先通过 /bridge/onboard 获取验证码并配置到 Maka。"},
+            status=401,
+        )
+    # Mock success — 扫码已由验证码替代
+    return web.json_response({
+        "ok": True,
+        "qrcode": None,
+        "expired": False,
+        "loggedIn": True,
+        "diagnostic": "Maka 已通过验证码授权，无需扫码。",
     })
 
 
 # ── internal endpoints (for Hermes plugin) ────────────────────────────────
 
 async def handle_inbound(request: web.Request) -> web.Response:
-    """INBOUND: Hermes plugin submits a message to be processed by Maka."""
+    """POST /bridge/inbound — Hermes 插件投递消息，等待 Maka 回复。"""
     state: BridgeState = request.app["state"]
     try:
         body = await request.json()
@@ -306,8 +350,9 @@ async def handle_inbound(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     state.outbound[request_id] = future
+    state._pending_by_chat[chat_id] = request_id  # for Maka's /send lookup
 
-    # Queue the message for Maka to pick up
+    # Queue the message for Maka to pick up via SSE stream
     msg = InboundMessage(
         text=text,
         chat_id=chat_id,
@@ -316,6 +361,8 @@ async def handle_inbound(request: web.Request) -> web.Response:
         queued_at=time.time(),
     )
     await state.inbound.put(msg)
+    # Also broadcast to active SSE subscribers
+    await state.broadcast_to_sse(msg)
 
     # Wait for Maka's reply (with timeout)
     try:
@@ -332,44 +379,28 @@ async def handle_inbound(request: web.Request) -> web.Response:
         return web.json_response({"ret": -1, "errmsg": "timeout"})
 
 
-async def handle_outbound(request: web.Request) -> web.Response:
-    """OUTBOUND: Hermes plugin polls for a specific request's reply."""
-    state: BridgeState = request.app["state"]
-    request_id = request.match_info.get("request_id", "")
-
-    if not request_id or request_id not in state.outbound:
-        return web.json_response({"ret": -1, "errmsg": "not_found"})
-
-    future = state.outbound[request_id]
-    try:
-        response = await asyncio.wait_for(future, timeout=120)
-        return web.json_response({
-            "ret": 0,
-            "text": response.text,
-            "request_id": request_id,
-        })
-    except asyncio.TimeoutError:
-        state.outbound.pop(request_id, None)
-        return web.json_response({"ret": -1, "errmsg": "timeout"})
-
-
 async def handle_onboard(request: web.Request) -> web.Response:
-    """ONBOARD: generate a verification code for Maka onboarding."""
+    """POST /bridge/onboard — 返回持久 token（替代扫码/验证码）。
+
+    token 在 bridge 首次启动时生成并持久化到磁盘，重启不变。
+    只需配置一次 Maka。如需更换 token，删除 wechat-bridge.token 后重启。
+    """
     state: BridgeState = request.app["state"]
-    code = state.generate_onboard_code()
     return web.json_response({
         "ret": 0,
-        "verification_code": code,
-        "expires_in": ONBOARD_TIMEOUT,
+        "token": state._bot_token,
+        "persistent": True,
         "instructions": (
-            f"Enter the verification code '{code}' in Maka's WeChat bot "
-            f"channel onboarding to complete authorization."
+            f"在 Maka 的 WeChat 通道设置中：\n"
+            f"1. webhookUrl: http://127.0.0.1:{request.app['port']}\n"
+            f"2. Bot Token: {state._bot_token}\n"
+            f"token 持久化保存，重启不换，只需配置一次。"
         ),
     })
 
 
 async def handle_status(request: web.Request) -> web.Response:
-    """STATUS: bridge health check."""
+    """GET /bridge/status — 桥接状态。"""
     state: BridgeState = request.app["state"]
     return web.json_response({
         "ret": 0,
@@ -377,26 +408,28 @@ async def handle_status(request: web.Request) -> web.Response:
         "authorized": state.is_authorized,
         "inbound_queue_size": state.inbound.qsize(),
         "outbound_pending": len(state.outbound),
+        "sse_connections": len(state._sse_queues),
         "port": request.app["port"],
     })
 
 
 # ── server setup ──────────────────────────────────────────────────────────
 
-async def create_app(port: int = DEFAULT_PORT) -> web.Application:
+async def create_app(port: int = DEFAULT_PORT, token: str = "") -> web.Application:
     """Create and configure the aiohttp web application."""
     app = web.Application()
-    app["state"] = BridgeState()
+    app["state"] = BridgeState(token)
     app["port"] = port
 
-    # iLink endpoints (Maka calls these)
-    app.router.add_post("/ilink/bot/getconfig", handle_getconfig)
-    app.router.add_post("/ilink/bot/getupdates", handle_getupdates)
-    app.router.add_post("/ilink/bot/sendmessage", handle_sendmessage)
+    # Maka bridge protocol endpoints
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/send", handle_send)
+    app.router.add_get("/messages/stream", handle_messages_stream)
+    app.router.add_get("/api/weixin/qrcode", handle_qrcode)
+    app.router.add_get("/qrcode", handle_qrcode)
 
-    # Internal endpoints (Hermes plugin calls these)
+    # Internal endpoints (Hermes plugin)
     app.router.add_post("/bridge/inbound", handle_inbound)
-    app.router.add_get("/bridge/outbound/{request_id}", handle_outbound)
     app.router.add_post("/bridge/onboard", handle_onboard)
     app.router.add_get("/bridge/status", handle_status)
 
@@ -405,14 +438,18 @@ async def create_app(port: int = DEFAULT_PORT) -> web.Application:
 
 def run_bridge(port: int = DEFAULT_PORT) -> None:
     """Run the bridge server."""
-    if aiohttp is None:
+    if web is None:
         print("ERROR: aiohttp is required. Install with: pip install aiohttp")
         return
 
-    app = asyncio.run(create_app(port))
+    token = _load_or_create_token()
+    app = asyncio.run(create_app(port, token))
     print(f"[wechat-bridge] listening on http://127.0.0.1:{port}")
-    print(f"[wechat-bridge] iLink endpoints: /ilink/bot/{{getconfig,getupdates,sendmessage}}")
-    print(f"[wechat-bridge] internal endpoints: /bridge/{{inbound,outbound,onboard,status}}")
+    print(f"[wechat-bridge] Maka bridge endpoints: /health /send /messages/stream /qrcode")
+    print(f"[wechat-bridge] internal endpoints: /bridge/{{inbound,onboard,status}}")
+    print(f"[wechat-bridge] auth: Authorization: Bearer <token>")
+    print(f"[wechat-bridge] TOKEN: {token}")
+    print(f"[wechat-bridge] 在 Maka WeChat 通道填入：webhookUrl=http://127.0.0.1:{port}, Bot Token={token}")
     web.run_app(app, host="127.0.0.1", port=port)
 
 
@@ -420,24 +457,15 @@ def run_bridge(port: int = DEFAULT_PORT) -> None:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="wechat-bridge: fake iLink server for Maka")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Listen port (default: {DEFAULT_PORT})")
-    parser.add_argument("--onboard", action="store_true", help="Generate onboarding code and exit")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(description="wechat-bridge — Maka 本地桥接服务器")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"端口 (default: {DEFAULT_PORT})")
+    parser.add_argument("--debug", action="store_true", help="调试日志")
     args = parser.parse_args()
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
-
-    if args.onboard:
-        state = BridgeState()
-        code = state.generate_onboard_code()
-        print(f"Verification code: {code}")
-        print(f"Valid for: {ONBOARD_TIMEOUT}s")
-        print(f"POST /bridge/onboard on the running server for new codes")
-        return
 
     run_bridge(port=args.port)
 
