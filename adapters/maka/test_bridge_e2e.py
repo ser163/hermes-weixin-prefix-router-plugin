@@ -21,11 +21,10 @@ async def hermes_plugin_submit(session, text: str) -> dict:
 async def maka_poll_and_reply(session, auth_header: str) -> None:
     """Simulate Maka: poll getupdates, then send reply via sendmessage."""
     async with aiohttp.ClientSession() as s:
+        headers = {"Authorization": auth_header}
         # Poll getupdates until a message arrives
         for attempt in range(30):
-            async with s.post(
-                f"{BASE}/ilink/bot/getupdates", json={}
-            ) as resp:
+            async with s.post(f"{BASE}/ilink/bot/getupdates", json={}, headers=headers) as resp:
                 data = await resp.json()
                 messages = data.get("messages", [])
                 if messages:
@@ -47,9 +46,7 @@ async def maka_poll_and_reply(session, auth_header: str) -> None:
                             "context_token": ctx,
                         }
                     }
-                    async with s.post(
-                        f"{BASE}/ilink/bot/sendmessage", json=reply
-                    ) as r2:
+                    async with s.post(f"{BASE}/ilink/bot/sendmessage", json=reply, headers=headers) as r2:
                         await r2.json()
                     print(f"[maka] polled msg: {received!r}, replied OK")
                     return
@@ -78,7 +75,9 @@ async def main():
             hermes_plugin_submit(session, "请分析一下今天的任务")
         )
         await asyncio.sleep(0.5)  # let inbound land
-        poll_task = asyncio.create_task(maka_poll_and_reply(session, ""))
+        poll_task = asyncio.create_task(
+            maka_poll_and_reply(session, f"Bearer {code}")
+        )
 
         # Wait for both
         results = await asyncio.gather(submit_task, poll_task)

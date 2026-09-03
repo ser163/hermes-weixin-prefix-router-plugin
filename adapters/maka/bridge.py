@@ -147,6 +147,21 @@ class BridgeState:
 
 # ── iLink endpoints (for Maka) ────────────────────────────────────────────
 
+async def _require_auth(request: web.Request, state: BridgeState) -> bool:
+    """Check that the request carries a valid bot token.
+
+    Returns True if authorized. If not, the response has already been sent.
+    """
+    if not state.is_authorized:
+        # Already handled by the calling handler — just return False
+        return False
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {state._bot_token}"
+    if auth.strip() == expected:
+        return True
+    return False
+
+
 async def handle_getconfig(request: web.Request) -> web.Response:
     """GETCONFIG: validate token and return config."""
     state: BridgeState = request.app["state"]
@@ -180,6 +195,10 @@ async def handle_getconfig(request: web.Request) -> web.Response:
             },
         })
 
+    # Authorized — validate token
+    if not await _require_auth(request, state):
+        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
+
     # Normal getconfig
     return web.json_response({
         "ret": 0,
@@ -193,6 +212,8 @@ async def handle_getupdates(request: web.Request) -> web.Response:
     state: BridgeState = request.app["state"]
     if not state.is_authorized:
         return web.json_response({"ret": -2, "errmsg": "not_authorized"})
+    if not await _require_auth(request, state):
+        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
 
     try:
         # Wait for a message from the inbound queue (with timeout)
@@ -219,6 +240,8 @@ async def handle_sendmessage(request: web.Request) -> web.Response:
     state: BridgeState = request.app["state"]
     if not state.is_authorized:
         return web.json_response({"ret": -2, "errmsg": "not_authorized"})
+    if not await _require_auth(request, state):
+        return web.json_response({"ret": -2, "errmsg": "invalid_token"})
 
     try:
         body = await request.json()
