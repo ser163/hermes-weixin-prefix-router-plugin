@@ -170,6 +170,78 @@ In WeChat, send a message to your bot:
 5. **Adapter route**: schedules `_forward_to_adapter()` (async → external agent → response → WeChat reply), returns `{"action": "skip"}` to bypass Hermes dispatch
 6. **No match**: returns `None` → normal Hermes dispatch
 
+## Maka Integration (wechat-bridge)
+
+The Maka adapter (`adapters/maka/`) bridges Hermes's WeChat gateway to
+**Apache Maka** — a local-first AI agent workspace that ships its own
+WeChat (iLink) bot channel. Maka is configured to connect its WeChat bot
+channel to a **local fake iLink server** (`bridge.py`) instead of the real
+Tencent endpoint, so the plugin can pump WeChat messages into Maka and
+deliver Maka's replies back over the same WeChat conversation.
+
+### Architecture
+
+```
+WeChat user
+   │
+   ▼
+Hermes WeChat gateway ── @maka message ──► weixin-prefix-router plugin
+   │                                              │ POST /bridge/inbound
+   │                                              ▼
+   │                                    wechat-bridge (127.0.0.1:19890)
+   │                                              │ getupdates (long-poll)
+   │                                              ▼
+   │                                    Maka WeChat bot channel ──► Maka agent
+   │                                              ▲ sendmessage (reply)
+   │                                              │
+   └─────────────── reply via WeChat ◄────────────┘
+```
+
+### 1. Start the bridge
+
+```bash
+cd adapters/maka
+python bridge.py                # listens on 127.0.0.1:19890
+```
+
+### 2. Get a verification code
+
+```bash
+curl -X POST http://127.0.0.1:19890/bridge/onboard
+# → {"ret":0, "verification_code":"482913", "expires_in":300, ...}
+```
+
+### 3. Configure Maka's WeChat bot channel
+
+In Maka settings → Remote access (远程接入) → WeChat channel, enter the
+**verification code as the bot token** instead of scanning a QR code. The
+bridge validates the code and promotes it to the channel's bot token.
+
+### 4. Route WeChat messages to Maka
+
+`routes.json` (plugin directory):
+
+```json
+{
+  "@coder": "coder",
+  "@maka": {"type": "adapter", "path": "maka"}
+}
+```
+
+Send `@maka <message>` in WeChat → routed to Maka's agent → the reply
+comes back in the same WeChat chat.
+
+### Bridge endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /ilink/bot/getconfig` | Maka onboarding/authorization (iLink protocol) |
+| `POST /ilink/bot/getupdates` | Maka long-poll: deliver queued WeChat messages |
+| `POST /ilink/bot/sendmessage` | Maka replies → captured for Hermes plugin |
+| `POST /bridge/inbound` | Hermes plugin: submit message, wait for reply |
+| `POST /bridge/onboard` | Generate 6-digit verification code |
+| `GET /bridge/status` | Health check |
+
 ## Development
 
 ### Repository structure

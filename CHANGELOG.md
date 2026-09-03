@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-03
+
+### Added
+
+- **wechat-bridge** (`adapters/maka/bridge.py`) — local iLink-compatible server
+  that acts as a fake Tencent WeChat server for Maka's bot channel. Maka
+  connects to the bridge instead of the real iLink API.
+- **Verification code onboarding** — replaces QR-code scanning with a
+  6-digit verification code. Generate via `POST /bridge/onboard`, enter
+  as the bot token in Maka's WeChat channel settings.
+- **Full iLink protocol** — `getconfig` (authorization + onboarding),
+  `getupdates` (long-poll message delivery), `sendmessage` (reply capture).
+- **Hermes plugin integration** — `POST /bridge/inbound` submits a message
+  from Hermes's WeChat gateway and blocks until Maka's agent replies.
+- **E2E test** (`adapters/maka/test_bridge_e2e.py`) — verifies the complete
+  flow: onboard → authorize → submit → poll → reply → capture.
+- **Adapter directory** (`adapters/maka/`) — example implementation for
+  the Maka external agent integration.
+
+[0.3.0]: https://github.com/ser163/hermes-weixin-prefix-router-plugin/releases/tag/v0.3.0
+
 ## [0.2.0] - 2026-09-03
 
 ### Added
