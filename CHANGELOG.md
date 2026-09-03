@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-03
+
+### Changed
+
+- **Switch from iLink protocol to Maka's native local bridge protocol**
+  (v0.3.0 shipped an iLink-compatible fake server, but Maka's WeChat
+  channel in local mode actually calls `GET /health`, `GET /messages/stream`
+  (SSE), `POST /send`, `GET /qrcode` — not iLink endpoints. Rewritten to
+  match Maka's real behavior; verified end-to-end against Maka Desktop.)
+- **Persistent token replaces verification codes** — bridge generates a
+  32-char token on first start, persists to `wechat-bridge.token`, and
+  reuses it across restarts. Configure Maka once. Delete the file to rotate.
+- **Bearer auth** — all endpoints validate `Authorization: Bearer <token>`
+  (Maka's `wechatBridgeHeaders()`), not `X-API-Key`.
+
+### Fixed
+
+- Plugin: validate `source.profile` is a non-empty string before assigning
+  (prevents `TypeError: unhashable type: 'dict'` in gateway authz when a
+  stale session persists a dict profile)
+- Bridge: inbound wait timeout 120s → **600s** (Maka's deep-thinking model
+  can take several minutes; late replies were dropped as "unmatched")
+- Adapter: request timeout 150s → **620s** (must exceed the bridge wait)
+- Bridge: clean up `_pending_by_chat` on timeout to avoid stale state
+
+### Docs
+
+- `adapters/maka/README.md` rewritten for the local bridge protocol,
+  persistent token, endpoint table, verification checklist and
+  troubleshooting (updated in both repo and `E:\test\ai\maka\`)
+
+[0.3.1]: https://github.com/ser163/hermes-weixin-prefix-router-plugin/releases/tag/v0.3.1
+
 ## [0.3.0] - 2026-09-03
 
 ### Added

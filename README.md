@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Hermes Agent](https://img.shields.io/badge/Hermes%20Agent-Plugin-blue)](https://hermes-agent.nousresearch.com)
-![Version](https://img.shields.io/badge/version-0.2.0-orange)
+![Version](https://img.shields.io/badge/version-0.3.1-orange)
 
 Route WeChat (weixin) messages by message prefix to **different Hermes profiles** or **external AI agents** (Maka, Pi, or any agent with a programmatic interface). Messages without a configured prefix go to the default Hermes agent.
 
@@ -173,11 +173,12 @@ In WeChat, send a message to your bot:
 ## Maka Integration (wechat-bridge)
 
 The Maka adapter (`adapters/maka/`) bridges Hermes's WeChat gateway to
-**Apache Maka** — a local-first AI agent workspace that ships its own
-WeChat (iLink) bot channel. Maka is configured to connect its WeChat bot
-channel to a **local fake iLink server** (`bridge.py`) instead of the real
-Tencent endpoint, so the plugin can pump WeChat messages into Maka and
-deliver Maka's replies back over the same WeChat conversation.
+**Apache Maka** — a local-first AI agent workspace. Maka ships a WeChat bot
+channel that supports **local bridge mode**: it connects to a local
+wechat-bridge process instead of Tencent's servers. We implement that
+bridge, so Maka's agent can receive WeChat messages from Hermes and reply
+back over the same conversation — **no real WeChat credentials needed for
+Maka**, Hermes owns the WeChat connection.
 
 ### Architecture
 
@@ -186,13 +187,13 @@ WeChat user
    │
    ▼
 Hermes WeChat gateway ── @maka message ──► weixin-prefix-router plugin
-   │                                              │ POST /bridge/inbound
+   │                                              │ POST /bridge/inbound (600s wait)
    │                                              ▼
    │                                    wechat-bridge (127.0.0.1:19860)
-   │                                              │ getupdates (long-poll)
+   │                                              │ SSE /messages/stream
    │                                              ▼
    │                                    Maka WeChat bot channel ──► Maka agent
-   │                                              ▲ sendmessage (reply)
+   │                                              ▲ POST /send (reply)
    │                                              │
    └─────────────── reply via WeChat ◄────────────┘
 ```
@@ -204,20 +205,32 @@ cd adapters/maka
 python bridge.py                # listens on 127.0.0.1:19860
 ```
 
-### 2. Get a verification code
+On first start the bridge generates a **persistent 32-char token** and
+stores it in `wechat-bridge.token` next to `bridge.py`. The token survives
+restarts — configure Maka once and forget it. Startup prints:
 
-```bash
-curl -X POST http://127.0.0.1:19860/bridge/onboard
-# → {"ret":0, "verification_code":"482913", "expires_in":300, ...}
+```
+[wechat-bridge] TOKEN: 5FF1EA83Cfd04164bEE8bB9b48B6fAf5
+[wechat-bridge] 在 Maka WeChat 通道填入：webhookUrl=http://127.0.0.1:19860, Bot Token=...
 ```
 
-### 3. Configure Maka's WeChat bot channel
+To rotate the token, delete `wechat-bridge.token` and restart.
 
-In Maka settings → Remote access (远程接入) → WeChat channel, enter the
-**verification code as the bot token** instead of scanning a QR code. The
-bridge validates the code and promotes it to the channel's bot token.
+### 2. Configure Maka's WeChat bot channel
 
-### 4. Route WeChat messages to Maka
+In Maka settings → Remote access (远程接入) → WeChat channel:
+
+| Field | Value |
+|-------|-------|
+| **webhookUrl** | `http://127.0.0.1:19860` |
+| **Bot Token** | the token from step 1 |
+
+Maka's connection test calls `GET /health` with
+`Authorization: Bearer <token>` → bridge validates → channel shows
+connected. **Enable the channel** so Maka starts listening on the SSE
+message stream.
+
+### 3. Route WeChat messages to Maka
 
 `routes.json` (plugin directory):
 
@@ -233,14 +246,33 @@ comes back in the same WeChat chat.
 
 ### Bridge endpoints
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /ilink/bot/getconfig` | Maka onboarding/authorization (iLink protocol) |
-| `POST /ilink/bot/getupdates` | Maka long-poll: deliver queued WeChat messages |
-| `POST /ilink/bot/sendmessage` | Maka replies → captured for Hermes plugin |
-| `POST /bridge/inbound` | Hermes plugin: submit message, wait for reply |
-| `POST /bridge/onboard` | Generate 6-digit verification code |
-| `GET /bridge/status` | Health check |
+| Endpoint | Direction | Purpose |
+|----------|-----------|---------|
+| `GET /health` | Maka → bridge | Connection test + identity (Bearer token) |
+| `GET /messages/stream` | Maka → bridge | SSE long-poll: deliver WeChat messages |
+| `POST /send` | Maka → bridge | Maka replies (`{wxid, text}`) → captured |
+| `GET /qrcode` | Maka → bridge | QR-code onboarding stub (auth via token instead) |
+| `POST /bridge/inbound` | Hermes → bridge | Plugin submits message, blocks for reply (600s) |
+| `POST /bridge/onboard` | Admin → bridge | Show the persistent token |
+| `GET /bridge/status` | Admin → bridge | Health check + queue depth + SSE conns |
+
+**Auth model**: all endpoints require `Authorization: Bearer <token>`.
+The token is the persistent 32-char string shown at startup.
+
+### Debugging the message flow
+
+```bash
+# 1. Bridge healthy? (expect authorized: true, sse_connections ≥ 1)
+curl http://127.0.0.1:19860/bridge/status
+
+# 2. Send @maka in WeChat → watch bridge log for:
+#    POST /bridge/inbound ... 200     ← Hermes submitted
+#    reply captured for request=...   ← Maka replied
+#    inbound reply ready: request=... ← delivered back to Hermes
+
+# 3. If "inbound timeout" appears → Maka's model took >600s, or the
+#    channel is disabled (check enabled: true in Maka settings)
+```
 
 ## Development
 
@@ -249,8 +281,14 @@ comes back in the same WeChat chat.
 ```
 hermes-weixin-prefix-router-plugin/
 ├── plugin.yaml          # Hermes plugin manifest
-├── __init__.py          # Plugin implementation (v0.2.0 dual routing)
+├── __init__.py          # Plugin implementation (v0.3.x dual routing)
 ├── routes.json          # Default routing configuration
+├── adapters/            # External agent adapter examples
+│   └── maka/            # Maka wechat-bridge integration
+│       ├── __init__.py  # Adapter: submits to bridge, returns reply
+│       ├── bridge.py    # Local wechat-bridge server (port 19860)
+│       ├── test_bridge_e2e.py  # End-to-end test (8 checks)
+│       └── README.md    # Maka integration guide
 ├── README.md            # This file
 ├── LICENSE              # MIT License
 ├── CHANGELOG.md         # Version history
