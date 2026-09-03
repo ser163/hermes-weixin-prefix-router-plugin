@@ -252,7 +252,13 @@ def _pre_gateway_dispatch(
         # ── Profile route (Hermes multiplex) ──────────────────────────────
         if route_type == "profile":
             profile_name = route_cfg.get("profile", "")
-            if not profile_name:
+            # Safety: profile must be a non-empty string (dicts cause
+            # TypeError: unhashable type in authz_mixin._pairing_store_for)
+            if not isinstance(profile_name, str) or not profile_name:
+                logger.warning(
+                    "[weixin-prefix-router] profile route %r has invalid profile=%r, skipping",
+                    prefix, profile_name,
+                )
                 continue
             source.profile = profile_name
             logger.info(
